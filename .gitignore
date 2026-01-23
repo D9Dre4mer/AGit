@@ -13,3 +13,4 @@ venv/
 *.exe
 /.cursor
 /Note
+/app
