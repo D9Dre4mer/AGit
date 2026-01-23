@@ -56,16 +56,26 @@ def generate_commit_message(diff_content: str) -> str:
         if len(diff_content) > max_diff_length:
             diff_content = diff_content[:max_diff_length] + "\n... (diff truncated due to length)"
         
-        prompt = f"""Generate a concise, clear commit message in English based on the following git diff changes.
-The commit message should:
-- Be concise (max 50 characters for the first line)
-- Clearly describe what was changed
-- Use format: "Type: Brief description"
+        prompt = f"""Generate a commit message in English based on the following git diff changes.
+
+The commit message should follow this format:
+1. First line: A short summary (max 50 characters) in format "Type: Brief description"
+2. Blank line
+3. Detailed description explaining what was changed and why (2-4 sentences)
+
+Example format:
+```
+feat: Add user authentication
+
+Implement login and registration functionality with JWT tokens.
+Added password hashing using bcrypt for security.
+Created user model and authentication middleware.
+```
 
 Git diff:
 {diff_content}
 
-Return only the commit message, without any explanations or special characters."""
+Return only the commit message in the format above, without any explanations or special characters."""
 
         # Generate content using new SDK
         response = client.models.generate_content(
@@ -73,7 +83,7 @@ Return only the commit message, without any explanations or special characters."
             contents=prompt,
             config={
                 'temperature': 0.7,
-                'max_output_tokens': 100,
+                'max_output_tokens': 300,  # Increased for description
             }
         )
         
@@ -82,11 +92,17 @@ Return only the commit message, without any explanations or special characters."
         # Clean commit message (remove quotes if present)
         commit_message = commit_message.strip('"').strip("'")
         
-        # Limit length
-        if len(commit_message) > 100:
-            commit_message = commit_message[:97] + "..."
+        # Ensure proper format: summary + blank line + description
+        lines = commit_message.split('\n')
+        if len(lines) > 1:
+            # Check if there's already a blank line
+            if lines[1].strip() != '':
+                # Insert blank line between summary and description
+                summary = lines[0]
+                description = '\n'.join(lines[1:])
+                commit_message = f"{summary}\n\n{description}"
         
-        return commit_message if commit_message else "Update code"
+        return commit_message if commit_message else "Update code\n\nCode changes"
         
     except Exception as e:
         # If error occurs, return default message

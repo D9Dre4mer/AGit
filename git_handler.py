@@ -131,20 +131,28 @@ def add_all_changes(repo_path: str) -> bool:
 
 def commit_changes(repo_path: str, message: str) -> bool:
     """
-    Run git commit with provided message
+    Run git commit with provided message (supports multi-line messages)
     
     Args:
         repo_path: Path to repository
-        message: Commit message
+        message: Commit message (can be multi-line with summary and description)
         
     Returns:
         True if successful
     """
     try:
-        # Escape commit message to prevent injection
-        # Use list arguments, message passed directly
+        # For multi-line commit messages, we need to use -m for each line
+        # or use stdin. Using -m multiple times is safer.
+        lines = message.split('\n')
+        
+        # Build git commit command with multiple -m flags
+        # This preserves the format: summary, blank line, description
+        commit_args = ['git', 'commit']
+        for line in lines:
+            commit_args.extend(['-m', line])
+        
         result = subprocess.run(
-            ['git', 'commit', '-m', message],
+            commit_args,
             cwd=repo_path,
             capture_output=True,
             encoding='utf-8',
