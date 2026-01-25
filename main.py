@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import messagebox, filedialog, scrolledtext
 import threading
 import os
+import sys
+from pathlib import Path
 from git_handler import (
     check_is_git_repo,
     get_git_status,
@@ -15,6 +17,18 @@ from git_handler import (
     push_changes
 )
 from gemini_client import generate_commit_message
+
+
+def resource_path(relative_path: str) -> str:
+    """
+    Return an absolute path to a bundled resource.
+
+    Supports running from source and from a PyInstaller onefile bundle.
+    """
+    base_path = getattr(sys, '_MEIPASS', None)
+    if base_path:
+        return os.path.join(base_path, relative_path)
+    return str(Path(__file__).resolve().parent / relative_path)
 
 
 # Deep Forest Green Color Scheme
@@ -40,6 +54,10 @@ class AGitApp:
         self.commit_message = None  # Store generated commit message
         self.message_generated = False  # Track if message has been generated
         self.repo_path_value = None  # Store validated repo path
+        self._logo_base = None
+        self._logo_ui = None
+        self._logo_icon = None
+        self._icon_images = []
         self.setup_window()
         self.create_widgets()
         
@@ -49,9 +67,65 @@ class AGitApp:
         self.root.geometry("500x550")  # Increased height for commit message display
         self.root.resizable(False, False)
         self.root.configure(bg=COLORS['bg_primary'])
+
+        self._load_logo_assets()
+        self._apply_window_icon()
         
         # Center window on screen
         self.center_window()
+        # Re-apply once the window is fully initialized (Windows title-bar icon).
+        self.root.after(0, self._apply_window_icon)
+
+    def _load_logo_assets(self):
+        """Load logo images for UI and window icon (best-effort)."""
+        try:
+            logo_path = resource_path(os.path.join("logo", "AGIT.png"))
+            if not os.path.exists(logo_path):
+                return
+
+            base = tk.PhotoImage(file=logo_path)
+            if base.width() <= 0:
+                return
+
+            ui_factor = max(1, base.width() // 64)
+            icon_factor = max(1, base.width() // 32)
+
+            self._logo_base = base
+            self._logo_ui = (
+                base.subsample(ui_factor, ui_factor)
+                if ui_factor > 1
+                else base
+            )
+            self._logo_icon = (
+                base.subsample(icon_factor, icon_factor)
+                if icon_factor > 1
+                else base
+            )
+
+            # Provide multiple icon sizes so Windows title bar can pick 16x16.
+            self._icon_images = []
+            for target in (16, 32, 48, 64):
+                factor = max(1, base.width() // target)
+                img = base.subsample(factor, factor) if factor > 1 else base
+                self._icon_images.append(img)
+        except Exception:
+            self._logo_base = None
+            self._logo_ui = None
+            self._logo_icon = None
+            self._icon_images = []
+
+    def _apply_window_icon(self):
+        """Apply window icon (best-effort)."""
+        if not self._logo_icon:
+            return
+        try:
+            if self._icon_images:
+                self.root.iconphoto(True, *self._icon_images)
+            else:
+                self.root.iconphoto(True, self._logo_icon)
+        except Exception:
+            # Some Tk builds may not support this; ignore.
+            return
         
     def center_window(self):
         """Center window on screen"""
@@ -67,16 +141,19 @@ class AGitApp:
         # Main container with padding
         main_frame = tk.Frame(self.root, bg=COLORS['bg_primary'], padx=30, pady=30)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Title
+
+        # Header (title only)
+        header_frame = tk.Frame(main_frame, bg=COLORS['bg_primary'])
+        header_frame.pack(fill=tk.X, pady=(0, 20))
+
         title_label = tk.Label(
-            main_frame,
+            header_frame,
             text="AGit - Auto Commit",
             font=('Segoe UI', 18, 'bold'),
             bg=COLORS['bg_primary'],
-            fg=COLORS['text_primary']
+            fg=COLORS['text_primary'],
         )
-        title_label.pack(pady=(0, 20))
+        title_label.pack()
         
         # Repository Path Section
         repo_frame = tk.Frame(main_frame, bg=COLORS['bg_primary'])

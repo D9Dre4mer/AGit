@@ -3,11 +3,79 @@ Gemini Client Module
 Integrates with Google Gemini API to automatically generate commit messages
 """
 import os
-from dotenv import load_dotenv
-from google.genai import Client
+import sys
+from pathlib import Path
 
-# Load environment variables
-load_dotenv()
+try:
+    # Optional dependency: PyInstaller sometimes misses it.
+    from dotenv import load_dotenv  # type: ignore
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+
+def _load_env_fallback() -> None:
+    """
+    Minimal .env loader if python-dotenv is not available.
+
+    Looks for `.env` next to the executable (PyInstaller) or next to this file.
+    """
+    candidates: list[Path] = []
+
+    # When frozen, prefer the folder containing the exe.
+    if getattr(sys, 'frozen', False):
+        try:
+            candidates.append(Path(sys.executable).resolve().parent / '.env')
+        except Exception:
+            pass
+
+    # Source run: alongside this module.
+    try:
+        candidates.append(Path(__file__).resolve().parent / '.env')
+    except Exception:
+        pass
+
+    # As a last resort, current working directory.
+    candidates.append(Path.cwd() / '.env')
+
+    env_path = next(
+        (p for p in candidates if p.exists() and p.is_file()),
+        None,
+    )
+    if not env_path:
+        return
+
+    try:
+        raw_text = env_path.read_text(
+            encoding='utf-8',
+            errors='replace',
+        )
+        for raw in raw_text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                continue
+            os.environ.setdefault(key, value)
+    except Exception:
+        return
+
+
+def _load_env() -> None:
+    """Load environment variables from `.env` (best-effort)."""
+    if load_dotenv is not None:
+        try:
+            load_dotenv()
+            return
+        except Exception:
+            pass
+    _load_env_fallback()
+
+
+# Load environment variables (best-effort)
+_load_env()
 
 # Timeout for API requests (30 seconds)
 API_TIMEOUT = 30
@@ -24,7 +92,14 @@ def initialize_gemini():
         raise Exception("Please configure GEMINI_API_KEY in .env file")
 
     try:
+        # Lazy import so the GUI can still start even if dependencies are missing.
+        from google.genai import Client  # type: ignore
         return Client(api_key=api_key)
+    except ModuleNotFoundError as e:
+        raise Exception(
+            "Missing dependency: google-genai. "
+            "Please install requirements and rebuild the executable."
+        ) from e
     except Exception as e:
         raise Exception(f"Error initializing Gemini API: {str(e)}")
 
