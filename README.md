@@ -37,24 +37,11 @@
    cd AGit
    ```
 
-2. Create and activate virtual environment:
-   
-   **Windows (PowerShell):**
-   ```powershell
-   python -m venv venv
-   .\venv\Scripts\Activate.ps1
-   ```
-   
-   **Windows (CMD):**
-   ```cmd
-   python -m venv venv
-   venv\Scripts\activate.bat
-   ```
-   
-   **Linux/Mac:**
+2. Create and activate Conda environment (recommended):
+
    ```bash
-   python3 -m venv venv
-   source venv/bin/activate
+   conda create -n agit python=3.11 -y
+   conda activate agit
    ```
 
 3. Install dependencies:
@@ -78,8 +65,9 @@
 
 Để build file exe từ source code:
 
-1. Cài đặt PyInstaller:
+1. Cài đặt dependencies để build:
    ```bash
+   pip install -r requirements.txt
    pip install -r requirements-dev.txt
    ```
 

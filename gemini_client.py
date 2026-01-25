@@ -92,7 +92,8 @@ def initialize_gemini():
         raise Exception("Please configure GEMINI_API_KEY in .env file")
 
     try:
-        # Lazy import so the GUI can still start even if dependencies are missing.
+        # Lazy import so the GUI can still start even if dependencies
+        # are missing.
         from google.genai import Client  # type: ignore
         return Client(api_key=api_key)
     except ModuleNotFoundError as e:
@@ -107,10 +108,10 @@ def initialize_gemini():
 def generate_commit_message(diff_content: str) -> str:
     """
     Generate commit message from git change context using Gemini API
-    
+
     Args:
         diff_content: Git change context (status/log/stats/diffs/previews)
-        
+
     Returns:
         AI-generated commit message
     """
@@ -120,9 +121,22 @@ def generate_commit_message(diff_content: str) -> str:
     try:
         client = initialize_gemini()
 
+        def _is_truncated_or_compacted(text: str) -> bool:
+            markers = (
+                "truncated",
+                "omitted",
+                "... (truncated) ...",
+                "... (context truncated",
+                "more file diffs omitted",
+            )
+            lower = text.lower()
+            return any(m in lower for m in markers)
+
         # Limit input length to avoid exceeding model context.
-        # Prefer keeping both start and end rather than truncating only the start.
+        # Prefer keeping both start and end rather than truncating only the
+        # start.
         max_input_length = 120000  # ~120k characters
+        was_truncated = False
         if len(diff_content) > max_input_length:
             head_len = int(max_input_length * 0.7)
             tail_len = max_input_length - head_len
@@ -133,30 +147,68 @@ def generate_commit_message(diff_content: str) -> str:
                 "... (context truncated due to length) ...\n"
                 f"{tail}"
             )
+            was_truncated = True
 
-        prompt = (
-            "Generate a commit message in English based on the following git "
-            "change context.\n"
-            "The context may include git status, changed file lists, diff "
-            "summaries, untracked file previews, recent git log, and "
-            "staged/unstaged diffs.\n\n"
-            "The commit message should follow this format:\n"
-            "1. First line: A short summary (max 50 characters) in format "
-            '"Type: Brief description"\n'
-            "2. Blank line\n"
-            "3. Detailed description explaining what was changed and why "
-            "(2-4 sentences)\n\n"
-            "Example format:\n"
-            "```\n"
-            "feat: Add user authentication\n\n"
-            "Implement login and registration functionality with JWT tokens.\n"
-            "Added password hashing using bcrypt for security.\n"
-            "Created user model and authentication middleware.\n"
-            "```\n\n"
-            f"Git diff:\n{diff_content}\n\n"
-            "Return only the commit message in the format above, without any "
-            "explanations or special characters."
-        )
+        detailed_mode = was_truncated or _is_truncated_or_compacted(diff_content)
+
+        if detailed_mode:
+            prompt = (
+                "Generate a commit message in English based on the following git "
+                "change context.\n"
+                "The context may include git status, changed file lists, diff "
+                "summaries, untracked file previews, recent git log, and "
+                "staged/unstaged diffs.\n\n"
+                "Important: The context may be truncated/compacted. "
+                "If so, infer details from the file list and diff stats rather "
+                "than referencing exact line-level changes.\n\n"
+                "The commit message must follow this format:\n"
+                "1. First line: A short summary (max 50 characters) in format "
+                '"Type: Brief description"\n'
+                "2. Blank line\n"
+                "3. A detailed body (more detailed than usual):\n"
+                "   - Prefer 8-14 bullet points\n"
+                "   - Mention key files/modules when useful\n"
+                "   - Include rationale/impact where it is evident\n\n"
+                "Example format:\n"
+                "```\n"
+                "feat: Improve commit context handling\n\n"
+                "- Expand git context to include untracked previews\n"
+                "- Add staged/unstaged diff stats for better summarization\n"
+                "- Compact large diffs by file to preserve coverage\n"
+                "- Include recent history snapshots for broader context\n"
+                "- Improve truncation strategy to keep head+tail\n"
+                "```\n\n"
+                f"Git change context:\n{diff_content}\n\n"
+                "Return only the commit message in the format above, without "
+                "any extra commentary."
+            )
+            max_output_tokens = 700
+        else:
+            prompt = (
+                "Generate a commit message in English based on the following git "
+                "change context.\n"
+                "The context may include git status, changed file lists, diff "
+                "summaries, untracked file previews, recent git log, and "
+                "staged/unstaged diffs.\n\n"
+                "The commit message should follow this format:\n"
+                "1. First line: A short summary (max 50 characters) in format "
+                '"Type: Brief description"\n'
+                "2. Blank line\n"
+                "3. Detailed description explaining what was changed and why "
+                "(2-4 sentences)\n\n"
+                "Example format:\n"
+                "```\n"
+                "feat: Add user authentication\n\n"
+                "Implement login and registration functionality with "
+                "JWT tokens.\n"
+                "Added password hashing using bcrypt for security.\n"
+                "Created user model and authentication middleware.\n"
+                "```\n\n"
+                f"Git change context:\n{diff_content}\n\n"
+                "Return only the commit message in the format above, without "
+                "any explanations or special characters."
+            )
+            max_output_tokens = 300
 
         # Generate content using new SDK
         response = client.models.generate_content(
@@ -164,10 +216,10 @@ def generate_commit_message(diff_content: str) -> str:
             contents=prompt,
             config={
                 'temperature': 0.7,
-                'max_output_tokens': 300,  # Increased for description
+                'max_output_tokens': max_output_tokens,
             }
         )
-        
+
         commit_message = response.text.strip()
 
         # Clean commit message (remove quotes if present)
@@ -183,7 +235,11 @@ def generate_commit_message(diff_content: str) -> str:
                 description = '\n'.join(lines[1:])
                 commit_message = f"{summary}\n\n{description}"
         
-        return commit_message if commit_message else "Update code\n\nCode changes"
+        return (
+            commit_message
+            if commit_message
+            else "Update code\n\nCode changes"
+        )
 
     except Exception as e:
         # If error occurs, return default message
