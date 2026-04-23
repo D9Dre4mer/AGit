@@ -105,6 +105,63 @@ def initialize_gemini():
         raise Exception(f"Error initializing Gemini API: {str(e)}")
 
 
+def select_available_models(client) -> list[str]:
+    """
+    Query available models from API and return usable generation models.
+    This is fully dynamic per run and uses API-returned metadata only.
+    """
+    try:
+        candidates: list[tuple[int, int, str]] = []
+        for model in client.models.list():
+            name = getattr(model, "name", "") or ""
+            # model names come as "models/<name>"
+            normalized = name.split("/", 1)[-1]
+            if not normalized:
+                continue
+
+            supported_actions = getattr(model, "supported_actions", []) or []
+            # Keep only general-purpose generation models using action metadata.
+            # Requiring batch + cache support filters out TTS/live/embedding-like
+            # specialized endpoints without relying on model name hardcoding.
+            required_actions = {
+                "generateContent",
+                "countTokens",
+                "createCachedContent",
+                "batchGenerateContent",
+            }
+            if not required_actions.issubset(set(supported_actions)):
+                continue
+
+            description = (getattr(model, "description", "") or "").lower()
+            if any(
+                token in description
+                for token in (
+                    "robotics",
+                    "text to speech",
+                    "tts",
+                    "audio",
+                    "image",
+                    "embedding",
+                    "live api",
+                )
+            ):
+                continue
+
+            # Cost proxy from API metadata only:
+            # lower token limits are typically lower-cost serving tiers.
+            input_limit = int(getattr(model, "input_token_limit", 10**9) or 10**9)
+            output_limit = int(getattr(model, "output_token_limit", 10**9) or 10**9)
+            candidates.append((input_limit, output_limit, normalized))
+
+        # Sort cheapest-looking models first by metadata, then deduplicate by name.
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        ordered_names = [name for _, _, name in candidates]
+        unique_available = list(dict.fromkeys(ordered_names))
+        return unique_available
+    except Exception:
+        return []
+
+
 def generate_commit_message(diff_content: str) -> str:
     """
     Generate commit message from git change context using Gemini API
@@ -210,15 +267,48 @@ def generate_commit_message(diff_content: str) -> str:
             )
             max_output_tokens = 300
 
-        # Generate content using new SDK
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config={
-                'temperature': 0.7,
-                'max_output_tokens': max_output_tokens,
-            }
-        )
+        model_candidates = select_available_models(client)
+        last_error = None
+        response = None
+
+        # Try candidates in order, fallback automatically on transient issues.
+        for selected_model in model_candidates:
+            try:
+                response = client.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                    config={
+                        'temperature': 0.7,
+                        'max_output_tokens': max_output_tokens,
+                    }
+                )
+                break
+            except Exception as model_error:
+                last_error = model_error
+                err_text = str(model_error).lower()
+                # Continue trying next model for quota/rate/temporary outages.
+                if any(
+                    token in err_text
+                    for token in (
+                        "resource_exhausted",
+                        "quota",
+                        "rate",
+                        "429",
+                        "503",
+                        "unavailable",
+                        "high demand",
+                        "temporarily",
+                        "not found",
+                        "unsupported",
+                    )
+                ):
+                    continue
+                raise
+
+        if response is None:
+            raise Exception(
+                f"No usable model available for current API key. Last error: {last_error}"
+            )
 
         commit_message = response.text.strip()
 
