@@ -1,6 +1,7 @@
 """
 Build script to create executable file from Python application
 """
+
 import PyInstaller.__main__
 import importlib.util
 import os
@@ -21,8 +22,8 @@ def _require_module(module_name: str, install_hint: str) -> None:
             f"- Module: {module_name}\n"
             f"- Python: {python_exe}\n\n"
             "Fix (run exactly with this Python):\n"
-            f"  \"{python_exe}\" -m pip install -r requirements.txt\n"
-            f"  \"{python_exe}\" -m pip install -r requirements-dev.txt\n\n"
+            f'  "{python_exe}" -m pip install -r requirements.txt\n'
+            f'  "{python_exe}" -m pip install -r requirements-dev.txt\n\n'
             f"Hint: {install_hint}"
         )
 
@@ -105,50 +106,50 @@ def build_exe():
     """Build executable file using PyInstaller"""
 
     # Remove old build and dist directories if they exist
-    _safe_rmtree('build')
-    _safe_rmtree('dist')
+    _safe_rmtree("build")
+    _safe_rmtree("dist")
 
     # Preflight: make sure deps exist in the build environment.
-    _require_module('PIL', "pip install -r requirements-dev.txt")
-    _require_module('google.genai', "pip install -r requirements.txt")
+    _require_module("PIL", "pip install -r requirements-dev.txt")
+    _require_module("google.genai", "pip install -r requirements.txt")
 
-    logo_png = os.path.join('logo', 'AGIT.png')
-    logo_ico = os.path.join('logo', 'AGIT.ico')
+    logo_png = os.path.join("logo", "AGIT.png")
+    logo_ico = os.path.join("logo", "AGIT.ico")
     _ensure_ico(logo_png, logo_ico)
     logo_ico_abs = os.path.abspath(logo_ico)
 
     # PyInstaller arguments
     args = [
-        'main.py',                          # Main script
-        '--name=AGit',                      # Executable file name
-        '--onefile',                        # Create single exe file
-        '--windowed',                       # Don't show console window
-        f'--icon={logo_ico_abs}',           # EXE file icon (Explorer)
-        '--clean',                          # Clean old cache
-        '--noconfirm',                      # Don't ask for confirmation
-        '--add-data=.env.example;.',        # Include .env.example
-        '--add-data=logo/AGIT.png;logo',    # Include app logo
-        '--add-data=logo/AGIT.ico;logo',    # Include ico (optional)
+        "main.py",  # Main script
+        "--name=AGit",  # Executable file name
+        "--onefile",  # Create single exe file
+        "--windowed",  # Don't show console window
+        f"--icon={logo_ico_abs}",  # EXE file icon (Explorer)
+        "--clean",  # Clean old cache
+        "--noconfirm",  # Don't ask for confirmation
+        "--add-data=.env.example;.",  # Include .env.example
+        "--add-data=logo/AGIT.png;logo",  # Include app logo
+        "--add-data=logo/AGIT.ico;logo",  # Include ico (optional)
         # Keep Gemini SDK bundleable in onefile:
-        '--hidden-import=google.genai',
-        '--collect-all=google.genai',
-        '--collect-submodules=google.genai',
+        "--hidden-import=google.genai",
+        "--collect-all=google.genai",
+        "--collect-submodules=google.genai",
     ]
 
     # Run PyInstaller
     PyInstaller.__main__.run(args)
 
-    exe_path = os.path.abspath(os.path.join('dist', 'AGit.exe'))
+    exe_path = os.path.abspath(os.path.join("dist", "AGit.exe"))
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("Build completed!")
-    print("="*50)
+    print("=" * 50)
     print(f"Executable file created at: {exe_path}")
     print("\nNote:")
     print("- Copy .env.example file and rename it to .env")
     print("- Fill in GEMINI_API_KEY in the .env file")
     print("- Place .env file in the same directory as AGit.exe")
-    print("="*50)
+    print("=" * 50)
 
 
 if __name__ == "__main__":

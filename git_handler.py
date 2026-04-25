@@ -2,6 +2,7 @@
 Git Handler Module
 Handles Git command execution
 """
+
 import subprocess
 import os
 from pathlib import Path
@@ -10,10 +11,10 @@ from typing import Optional
 
 # Set environment to use UTF-8 encoding for git commands
 GIT_ENV = os.environ.copy()
-GIT_ENV['PYTHONIOENCODING'] = 'utf-8'
+GIT_ENV["PYTHONIOENCODING"] = "utf-8"
 # Force git to use UTF-8
-GIT_ENV['LANG'] = 'en_US.UTF-8'
-GIT_ENV['LC_ALL'] = 'en_US.UTF-8'
+GIT_ENV["LANG"] = "en_US.UTF-8"
+GIT_ENV["LC_ALL"] = "en_US.UTF-8"
 
 DEFAULT_AI_CONTEXT_MAX_CHARS = 120_000
 DEFAULT_UNTRACKED_PREVIEW_MAX_FILES = 10
@@ -30,14 +31,14 @@ def _run_git(
 ) -> subprocess.CompletedProcess:
     """Run a git command and return CompletedProcess."""
     return subprocess.run(
-        ['git', *args],
+        ["git", *args],
         cwd=repo_path,
         capture_output=True,
-        encoding='utf-8',
-        errors='replace',
+        encoding="utf-8",
+        errors="replace",
         env=GIT_ENV,
         check=check,
-        timeout=timeout
+        timeout=timeout,
     )
 
 
@@ -63,7 +64,7 @@ def _run_git_nul_list(
     out = _run_git_stdout(repo_path, args=args, timeout=timeout, check=False)
     if not out:
         return []
-    return [p for p in out.split('\x00') if p]
+    return [p for p in out.split("\x00") if p]
 
 
 def _safe_read_text_file(path: Path, max_chars: int) -> tuple[str, bool]:
@@ -73,10 +74,10 @@ def _safe_read_text_file(path: Path, max_chars: int) -> tuple[str, bool]:
     """
     try:
         # Use bytes first so we can cap without loading huge files.
-        with path.open('rb') as f:
+        with path.open("rb") as f:
             data = f.read(max_chars + 1)
         truncated = len(data) > max_chars
-        text = data[:max_chars].decode('utf-8', errors='replace')
+        text = data[:max_chars].decode("utf-8", errors="replace")
         return text, truncated
     except Exception:
         return "", False
@@ -125,13 +126,11 @@ def _compact_diff_by_file(
         return diff_text
 
     # Find file chunk boundaries at "diff --git".
-    indices = [
-        m.start() for m in re.finditer(r"(?m)^diff --git ", diff_text)
-    ]
+    indices = [m.start() for m in re.finditer(r"(?m)^diff --git ", diff_text)]
     if not indices:
         return _truncate_middle(diff_text, max_chars)
 
-    preamble = diff_text[:indices[0]].strip()
+    preamble = diff_text[: indices[0]].strip()
     file_chunks: list[tuple[str, str]] = []
     for i, start in enumerate(indices):
         end = indices[i + 1] if i + 1 < len(indices) else len(diff_text)
@@ -153,10 +152,7 @@ def _compact_diff_by_file(
 
     header = ""
     if preamble:
-        header = (
-            _truncate_middle(preamble, min(2_000, max_chars)).strip()
-            + "\n\n"
-        )
+        header = _truncate_middle(preamble, min(2_000, max_chars)).strip() + "\n\n"
 
     remaining = max_chars - len(header)
     if remaining <= 0:
@@ -192,11 +188,11 @@ def _get_recent_history(
     - Also includes oldest commits (tail) to reflect full history
     - Adds total commit count for context
     """
-    pretty = '--pretty=format:%h %s (%an, %ar)'
+    pretty = "--pretty=format:%h %s (%an, %ar)"
 
     total_str = _run_git_stdout(
         repo_path,
-        ['rev-list', '--count', 'HEAD'],
+        ["rev-list", "--count", "HEAD"],
         timeout=30,
         check=False,
     )
@@ -207,13 +203,13 @@ def _get_recent_history(
 
     newest = _run_git_stdout(
         repo_path,
-        ['log', f'-n{max_commits}', pretty],
+        ["log", f"-n{max_commits}", pretty],
         timeout=60,
         check=False,
     )
     oldest = _run_git_stdout(
         repo_path,
-        ['log', '--reverse', f'-n{DEFAULT_LOG_OLDEST_COMMITS}', pretty],
+        ["log", "--reverse", f"-n{DEFAULT_LOG_OLDEST_COMMITS}", pretty],
         timeout=60,
         check=False,
     )
@@ -237,17 +233,17 @@ def _get_changed_paths(repo_path: str) -> dict[str, list[str]]:
     """
     staged = _run_git_nul_list(
         repo_path,
-        ['diff', '--cached', '--name-only', '-z'],
+        ["diff", "--cached", "--name-only", "-z"],
         timeout=30,
     )
     unstaged = _run_git_nul_list(
         repo_path,
-        ['diff', '--name-only', '-z'],
+        ["diff", "--name-only", "-z"],
         timeout=30,
     )
     untracked = _run_git_nul_list(
         repo_path,
-        ['ls-files', '--others', '--exclude-standard', '-z'],
+        ["ls-files", "--others", "--exclude-standard", "-z"],
         timeout=30,
     )
     return {
@@ -278,13 +274,13 @@ def _build_ai_change_context(repo_path: str, status_short: str) -> str:
     # Smaller, higher-signal summaries
     diff_stat = _run_git_stdout(
         repo_path,
-        ['diff', '--stat'],
+        ["diff", "--stat"],
         timeout=60,
         check=False,
     )
     diff_stat_cached = _run_git_stdout(
         repo_path,
-        ['diff', '--cached', '--stat'],
+        ["diff", "--cached", "--stat"],
         timeout=60,
         check=False,
     )
@@ -292,13 +288,13 @@ def _build_ai_change_context(repo_path: str, status_short: str) -> str:
     # Diffs (use low context to fit more hunks)
     diff_unstaged = _run_git_stdout(
         repo_path,
-        ['diff', '--no-color', '--unified=1'],
+        ["diff", "--no-color", "--unified=1"],
         timeout=120,
         check=False,
     )
     diff_staged = _run_git_stdout(
         repo_path,
-        ['diff', '--cached', '--no-color', '--unified=1'],
+        ["diff", "--cached", "--no-color", "--unified=1"],
         timeout=120,
         check=False,
     )
@@ -318,20 +314,15 @@ def _build_ai_change_context(repo_path: str, status_short: str) -> str:
             )
             if content:
                 suffix = "\n... (file truncated) ..." if truncated else ""
-                untracked_previews.append(
-                    f"### {rel}\n{content}{suffix}".strip()
-                )
+                untracked_previews.append(f"### {rel}\n{content}{suffix}".strip())
             else:
-                untracked_previews.append(
-                    f"### {rel}\n(binary or unreadable preview)"
-                )
+                untracked_previews.append(f"### {rel}\n(binary or unreadable preview)")
         else:
             untracked_previews.append(f"### {rel}\n(missing on disk)")
 
     context_parts: list[str] = []
     context_parts.append(
-        "## Git status (short)\n"
-        + (status_short if status_short else "(empty)")
+        "## Git status (short)\n" + (status_short if status_short else "(empty)")
     )
     context_parts.append(
         "## Changed paths\n"
@@ -404,15 +395,13 @@ def _build_ai_change_context(repo_path: str, status_short: str) -> str:
         if remaining <= 0:
             break
 
-    compact_context = (
-        non_diff + "\n\n" + "\n\n".join(compacted_diffs)
-    ).strip()
+    compact_context = (non_diff + "\n\n" + "\n\n".join(compacted_diffs)).strip()
     return _truncate_middle(compact_context, DEFAULT_AI_CONTEXT_MAX_CHARS)
 
 
 def check_is_git_repo(repo_path: str) -> bool:
     """Return True if repo_path looks like a Git repository."""
-    git_dir = Path(repo_path) / '.git'
+    git_dir = Path(repo_path) / ".git"
     return git_dir.exists() and git_dir.is_dir()
 
 
@@ -426,7 +415,7 @@ def get_git_status(repo_path: str) -> tuple[str, str]:
         # Get git status
         status_output = _run_git_stdout(
             repo_path,
-            ['status', '--short'],
+            ["status", "--short"],
             timeout=30,
             check=False,
         )
@@ -452,14 +441,14 @@ def add_all_changes(repo_path: str) -> bool:
     try:
         # Use list arguments to prevent shell injection
         subprocess.run(
-            ['git', 'add', '.'],
+            ["git", "add", "."],
             cwd=repo_path,
             capture_output=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             env=GIT_ENV,
             check=True,
-            timeout=30  # 30 second timeout
+            timeout=30,  # 30 second timeout
         )
         return True
     except subprocess.TimeoutExpired:
@@ -476,23 +465,23 @@ def commit_changes(repo_path: str, message: str) -> bool:
     try:
         # For multi-line commit messages, we need to use -m for each line
         # or use stdin. Using -m multiple times is safer.
-        lines = message.split('\n')
-        
+        lines = message.split("\n")
+
         # Build git commit command with multiple -m flags
         # This preserves the format: summary, blank line, description
-        commit_args = ['git', 'commit']
+        commit_args = ["git", "commit"]
         for line in lines:
-            commit_args.extend(['-m', line])
-        
+            commit_args.extend(["-m", line])
+
         subprocess.run(
             commit_args,
             cwd=repo_path,
             capture_output=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             env=GIT_ENV,
             check=True,
-            timeout=30  # 30 second timeout
+            timeout=30,  # 30 second timeout
         )
         return True
     except subprocess.TimeoutExpired:
@@ -509,28 +498,28 @@ def push_changes(repo_path: str) -> bool:
     try:
         # Check if remote exists
         remote_result = subprocess.run(
-            ['git', 'remote'],
+            ["git", "remote"],
             cwd=repo_path,
             capture_output=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             env=GIT_ENV,
-            check=False
+            check=False,
         )
-        
+
         if not remote_result.stdout.strip():
             raise Exception("Repository has no remote configured")
-        
+
         # Push to remote
         subprocess.run(
-            ['git', 'push'],
+            ["git", "push"],
             cwd=repo_path,
             capture_output=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             env=GIT_ENV,
             check=True,
-            timeout=120  # 2 minute timeout for push (may take time)
+            timeout=120,  # 2 minute timeout for push (may take time)
         )
         return True
     except subprocess.TimeoutExpired:

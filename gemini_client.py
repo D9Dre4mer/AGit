@@ -2,6 +2,7 @@
 Gemini Client Module
 Integrates with Google Gemini API to automatically generate commit messages
 """
+
 import os
 import sys
 from pathlib import Path
@@ -22,20 +23,20 @@ def _load_env_fallback() -> None:
     candidates: list[Path] = []
 
     # When frozen, prefer the folder containing the exe.
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         try:
-            candidates.append(Path(sys.executable).resolve().parent / '.env')
+            candidates.append(Path(sys.executable).resolve().parent / ".env")
         except Exception:
             pass
 
     # Source run: alongside this module.
     try:
-        candidates.append(Path(__file__).resolve().parent / '.env')
+        candidates.append(Path(__file__).resolve().parent / ".env")
     except Exception:
         pass
 
     # As a last resort, current working directory.
-    candidates.append(Path.cwd() / '.env')
+    candidates.append(Path.cwd() / ".env")
 
     env_path = next(
         (p for p in candidates if p.exists() and p.is_file()),
@@ -46,14 +47,14 @@ def _load_env_fallback() -> None:
 
     try:
         raw_text = env_path.read_text(
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
         )
         for raw in raw_text.splitlines():
             line = raw.strip()
-            if not line or line.startswith('#') or '=' not in line:
+            if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, value = line.split('=', 1)
+            key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             if not key:
@@ -83,18 +84,19 @@ API_TIMEOUT = 30
 
 def initialize_gemini():
     """Initialize and return the Gemini API client."""
-    api_key = os.getenv('GEMINI_API_KEY')
+    api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
         raise Exception("GEMINI_API_KEY not found in .env file")
 
-    if api_key == 'your_api_key_here':
+    if api_key == "your_api_key_here":
         raise Exception("Please configure GEMINI_API_KEY in .env file")
 
     try:
         # Lazy import so the GUI can still start even if dependencies
         # are missing.
         from google.genai import Client  # type: ignore
+
         return Client(api_key=api_key)
     except ModuleNotFoundError as e:
         raise Exception(
@@ -189,6 +191,53 @@ def generate_commit_message(diff_content: str) -> str:
             lower = text.lower()
             return any(m in lower for m in markers)
 
+        def _extract_finish_reason(resp) -> str:
+            """
+            Best-effort extraction of model finish reason.
+            Gemini SDK response shape may differ by version.
+            """
+            try:
+                candidates = getattr(resp, "candidates", None) or []
+                if not candidates:
+                    return ""
+                finish_reason = getattr(candidates[0], "finish_reason", "")
+                return str(finish_reason or "").strip().lower()
+            except Exception:
+                return ""
+
+        def _looks_incomplete_message(text: str) -> bool:
+            """
+            Heuristic for truncated commit messages:
+            - Ends with dangling punctuation/list marker
+            - Very short body despite requested structure
+            """
+            if not text:
+                return True
+
+            normalized = text.rstrip()
+            if not normalized:
+                return True
+
+            dangling_suffixes = (":", "-", "(", "[", "{", ",", "/", "\\")
+            if normalized.endswith(dangling_suffixes):
+                return True
+
+            lines = normalized.splitlines()
+            if len(lines) >= 2:
+                body_lines = [ln for ln in lines[1:] if ln.strip()]
+                # Body unexpectedly short often means token cut.
+                if len(body_lines) <= 1:
+                    return True
+
+            # No sentence terminator at the end can indicate cutoff.
+            if normalized[-1] not in (".", "!", "?", "`", ")", "]"):
+                # Allow complete bullet-list endings:
+                last_line = lines[-1].strip() if lines else ""
+                if not (last_line.startswith("- ") and len(last_line) > 3):
+                    return True
+
+            return False
+
         # Limit input length to avoid exceeding model context.
         # Prefer keeping both start and end rather than truncating only the
         # start.
@@ -200,9 +249,7 @@ def generate_commit_message(diff_content: str) -> str:
             head = diff_content[:head_len].rstrip()
             tail = diff_content[-tail_len:].lstrip()
             diff_content = (
-                f"{head}\n"
-                "... (context truncated due to length) ...\n"
-                f"{tail}"
+                f"{head}\n" "... (context truncated due to length) ...\n" f"{tail}"
             )
             was_truncated = True
 
@@ -270,74 +317,122 @@ def generate_commit_message(diff_content: str) -> str:
         model_candidates = select_available_models(client)
         last_error = None
         response = None
+        response_finish_reason = ""
+        selected_commit_message = ""
 
         # Try candidates in order, fallback automatically on transient issues.
+        # For each model, retry with a larger output budget if result looks cut.
+        token_attempts = [
+            max_output_tokens,
+            min(2048, max(max_output_tokens * 2, 900)),
+        ]
         for selected_model in model_candidates:
-            try:
-                response = client.models.generate_content(
-                    model=selected_model,
-                    contents=prompt,
-                    config={
-                        'temperature': 0.7,
-                        'max_output_tokens': max_output_tokens,
-                    }
-                )
-                break
-            except Exception as model_error:
-                last_error = model_error
-                err_text = str(model_error).lower()
-                # Continue trying next model for quota/rate/temporary outages.
-                if any(
-                    token in err_text
-                    for token in (
-                        "resource_exhausted",
-                        "quota",
-                        "rate",
-                        "429",
-                        "503",
-                        "unavailable",
-                        "high demand",
-                        "temporarily",
-                        "not found",
-                        "unsupported",
+            for output_token_budget in token_attempts:
+                try:
+                    response = client.models.generate_content(
+                        model=selected_model,
+                        contents=prompt,
+                        config={
+                            "temperature": 0.5,
+                            "max_output_tokens": output_token_budget,
+                        },
                     )
-                ):
-                    continue
-                raise
+                    commit_text = (getattr(response, "text", "") or "").strip()
+                    finish_reason = _extract_finish_reason(response)
 
-        if response is None:
+                    if not commit_text:
+                        response = None
+                        continue
+
+                    if (
+                        "max" in finish_reason
+                        or "length" in finish_reason
+                        or _looks_incomplete_message(commit_text)
+                    ):
+                        # Retry same model with larger budget.
+                        selected_commit_message = commit_text
+                        response_finish_reason = finish_reason
+                        response = None
+                        continue
+
+                    selected_commit_message = commit_text
+                    response_finish_reason = finish_reason
+                    break
+                except Exception as model_error:
+                    last_error = model_error
+                    err_text = str(model_error).lower()
+                    # Continue trying next model for quota/rate errors.
+                    if any(
+                        token in err_text
+                        for token in (
+                            "resource_exhausted",
+                            "quota",
+                            "rate",
+                            "429",
+                            "503",
+                            "unavailable",
+                            "high demand",
+                            "temporarily",
+                            "not found",
+                            "unsupported",
+                        )
+                    ):
+                        break
+                    raise
+            if selected_commit_message:
+                break
+
+        if not selected_commit_message:
             raise Exception(
-                f"No usable model available for current API key. Last error: {last_error}"
+                "No usable model available for current API key. "
+                f"Last error: {last_error}"
             )
 
-        commit_message = response.text.strip()
+        commit_message = selected_commit_message
 
         # Clean commit message (remove quotes if present)
         commit_message = commit_message.strip('"').strip("'")
 
         # Ensure proper format: summary + blank line + description
-        lines = commit_message.split('\n')
+        lines = commit_message.split("\n")
         if len(lines) > 1:
             # Check if there's already a blank line
-            if lines[1].strip() != '':
+            if lines[1].strip() != "":
                 # Insert blank line between summary and description
                 summary = lines[0]
-                description = '\n'.join(lines[1:])
+                description = "\n".join(lines[1:])
                 commit_message = f"{summary}\n\n{description}"
-        
-        return (
-            commit_message
-            if commit_message
-            else "Update code\n\nCode changes"
+
+        final_message = (
+            commit_message if commit_message else "Update code\n\nCode changes"
         )
+        # If still clearly max-token limited, add fallback note instead of
+        # returning a dangling sentence.
+        if (
+            response_finish_reason
+            and ("max" in response_finish_reason or "length" in response_finish_reason)
+            and _looks_incomplete_message(final_message)
+        ):
+            lines = final_message.splitlines()
+            if lines:
+                summary = lines[0]
+                body = "\n".join(lines[1:]).strip()
+                if not body:
+                    body = "- Update code changes based on current " "diff context."
+                if not body.endswith((".", "!", "?")):
+                    body = body + "."
+                final_message = (
+                    f"{summary}\n\n{body}\n"
+                    "- Additional details omitted due to output limits."
+                )
+
+        return final_message
 
     except Exception as e:
         # If error occurs, return default message
         error_msg = str(e)
         if "API_KEY" in error_msg or "api key" in error_msg.lower():
-            raise Exception(
-                "API key error. Please check GEMINI_API_KEY in .env file"
-            )
+            raise Exception("API key error. Please check GEMINI_API_KEY in .env file")
         elif "quota" in error_msg.lower() or "limit" in error_msg.lower():
             raise Exception("API quota exceeded. Please try again later.")
         else:
