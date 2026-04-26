@@ -107,13 +107,19 @@ def initialize_gemini():
         raise Exception(f"Error initializing Gemini API: {str(e)}")
 
 
-def select_available_models(client) -> list[str]:
+def _list_generation_models(
+    client,
+) -> list[tuple[str, int, int]]:
     """
-    Query available models from API and return usable generation models.
-    This is fully dynamic per run and uses API-returned metadata only.
+    List general-purpose text models with API-reported (input, output) limits.
+
+    Returns tuples of (model_name, input_token_limit, output_token_limit),
+    sorted by **largest input context first** so we can size the prompt to
+    the most capable model; all following models in the list can use the same
+    prompt.
     """
     try:
-        candidates: list[tuple[int, int, str]] = []
+        raw: list[tuple[int, int, str]] = []
         for model in client.models.list():
             name = getattr(model, "name", "") or ""
             # model names come as "models/<name>"
@@ -149,19 +155,208 @@ def select_available_models(client) -> list[str]:
             ):
                 continue
 
-            # Cost proxy from API metadata only:
-            # lower token limits are typically lower-cost serving tiers.
-            input_limit = int(getattr(model, "input_token_limit", 10**9) or 10**9)
-            output_limit = int(getattr(model, "output_token_limit", 10**9) or 10**9)
-            candidates.append((input_limit, output_limit, normalized))
+            input_limit = int(getattr(model, "input_token_limit", 0) or 0)
+            output_limit = int(getattr(model, "output_token_limit", 0) or 0)
+            if input_limit <= 0:
+                input_limit = 1_048_576
+            if output_limit <= 0:
+                output_limit = 8192
+            raw.append((input_limit, output_limit, normalized))
 
-        # Sort cheapest-looking models first by metadata, then deduplicate by name.
-        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-        ordered_names = [name for _, _, name in candidates]
-        unique_available = list(dict.fromkeys(ordered_names))
-        return unique_available
+        # Largest context first, then by output, then by name.
+        raw.sort(key=lambda x: (-x[0], -x[1], x[2]))
+        seen: set[str] = set()
+        out: list[tuple[str, int, int]] = []
+        for inp, outp, mname in raw:
+            if mname in seen:
+                continue
+            seen.add(mname)
+            out.append((mname, inp, outp))
+        return out
     except Exception:
         return []
+
+
+def select_available_models(client) -> list[str]:
+    """
+    Query available models from API and return usable generation models.
+    This is fully dynamic per run and uses API-returned metadata only.
+    """
+    return [m[0] for m in _list_generation_models(client)]
+
+
+# Margin between reported input_token_limit and count_tokens: packing,
+# system templates, and tiny tokenizer drift.
+_INPUT_TOKEN_SAFETY_MARGIN = 512
+
+
+def _head_tail_from_body(text: str, keep: int) -> str:
+    """
+    Keep at most `keep` characters from the body using a 70/30 head/tail
+    split and a clear marker. If `keep` covers the full string, return it
+    without a marker. Assumes `keep < len(text)` when a marker is used.
+    """
+    n = len(text)
+    if keep <= 0:
+        return ""
+    if n <= keep:
+        return text
+    head = int(keep * 0.7)
+    tail = keep - head
+    mark = "\n... (context truncated due to length) ...\n"
+    return text[:head].rstrip() + mark + text[-tail:].lstrip()
+
+
+def _read_total_tokens(count_response):
+    if count_response is None:
+        return None
+    n = getattr(count_response, "total_tokens", None)
+    if n is not None:
+        return int(n)
+    if isinstance(count_response, dict):
+        for key in ("total_tokens", "totalTokens"):
+            if key in count_response and count_response[key] is not None:
+                return int(count_response[key])
+    return None
+
+
+def _count_prompt_tokens(client, model, text: str):
+    try:
+        resp = client.models.count_tokens(model=model, contents=text)
+        return _read_total_tokens(resp)
+    except Exception:
+        return None
+
+
+def _fit_diff_to_input_tokens(
+    client,
+    model: str,
+    prefix: str,
+    suffix: str,
+    body: str,
+    max_input_tokens: int,
+) -> tuple[str, bool]:
+    """
+    Shrink `body` only (head+tail) until prefix+body+suffix is within
+    `max_input_tokens` according to the API tokenizer for `model`.
+    """
+    if max_input_tokens < 1:
+        max_input_tokens = 1
+
+    full = prefix + body + suffix
+    t_full = _count_prompt_tokens(client, model, full)
+    if t_full is not None and t_full <= max_input_tokens:
+        return body, False
+
+    if t_full is None:
+        # count_tokens failed: use a conservative char cap (~3 chars/token).
+        max_chars = max(4096, max_input_tokens * 3)
+        if len(body) <= max_chars:
+            return body, False
+        return _head_tail_from_body(body, max_chars), True
+
+    empty = prefix + suffix
+    t_empty = _count_prompt_tokens(client, model, empty)
+    if t_empty is not None and t_empty > max_input_tokens:
+        return body[: max(1, len(body) // 2)], True
+
+    n = len(body)
+    if n == 0:
+        return "", False
+
+    # Full prompt already over budget. Search the largest "keep" in
+    # [0, n - 1] using a head+tail+marker form only (no k == n), so token
+    # count is monotone increasing in k. (k == n is full text without a marker
+    # and is already known not to fit.)
+    lo, hi = 0, n - 1
+    best_keep = 0
+    for _ in range(40):
+        if lo > hi:
+            break
+        mid = (lo + hi + 1) // 2
+        cand = _head_tail_from_body(body, mid)
+        t_c = _count_prompt_tokens(client, model, prefix + cand + suffix)
+        if t_c is None:
+            hi = mid - 1
+            continue
+        if t_c <= max_input_tokens:
+            best_keep = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    out = _head_tail_from_body(body, best_keep)
+    return out, True
+
+
+def _build_commit_prompt_prefix_suffix(
+    use_detailed: bool,
+) -> tuple[str, str]:
+    """
+    Return (prefix, suffix) with the diff text inserted as prefix+body+suffix.
+    Must stay in sync with the instructions sent to the model.
+    """
+    if use_detailed:
+        prefix = (
+            "Generate a commit message in English based on the following git "
+            "change context.\n"
+            "The context may include git status, changed file lists, diff "
+            "summaries, untracked file previews, recent git log, and "
+            "staged/unstaged diffs.\n\n"
+            "Important: The context may be truncated/compacted. "
+            "If so, infer details from the file list and diff stats rather "
+            "than referencing exact line-level changes.\n\n"
+            "The commit message must follow this format:\n"
+            "1. First line: A short summary (max 50 characters) in format "
+            '"Type: Brief description"\n'
+            "2. Blank line\n"
+            "3. A detailed body (more detailed than usual):\n"
+            "   - Prefer 8-14 bullet points\n"
+            "   - Mention key files/modules when useful\n"
+            "   - Include rationale/impact where it is evident\n\n"
+            "Example format:\n"
+            "```\n"
+            "feat: Improve commit context handling\n\n"
+            "- Expand git context to include untracked previews\n"
+            "- Add staged/unstaged diff stats for better summarization\n"
+            "- Compact large diffs by file to preserve coverage\n"
+            "- Include recent history snapshots for broader context\n"
+            "- Improve truncation strategy to keep head+tail\n"
+            "```\n\n"
+            "Git change context:\n"
+        )
+        suffix = (
+            "\n\nReturn only the commit message in the format above, without "
+            "any extra commentary."
+        )
+    else:
+        prefix = (
+            "Generate a commit message in English based on the following git "
+            "change context.\n"
+            "The context may include git status, changed file lists, diff "
+            "summaries, untracked file previews, recent git log, and "
+            "staged/unstaged diffs.\n\n"
+            "The commit message should follow this format:\n"
+            "1. First line: A short summary (max 50 characters) in format "
+            '"Type: Brief description"\n'
+            "2. Blank line\n"
+            "3. Detailed description explaining what was changed and why "
+            "(2-4 sentences)\n\n"
+            "Example format:\n"
+            "```\n"
+            "feat: Add user authentication\n\n"
+            "Implement login and registration functionality with "
+            "JWT tokens.\n"
+            "Added password hashing using bcrypt for security.\n"
+            "Created user model and authentication middleware.\n"
+            "```\n\n"
+            "Git change context:\n"
+        )
+        suffix = (
+            "\n\nReturn only the commit message in the format above, without "
+            "any explanations or special characters."
+        )
+    return prefix, suffix
 
 
 def generate_commit_message(diff_content: str) -> str:
@@ -238,149 +433,101 @@ def generate_commit_message(diff_content: str) -> str:
 
             return False
 
-        # Limit input length to avoid exceeding model context.
-        # Prefer keeping both start and end rather than truncating only the
-        # start.
-        max_input_length = 120000  # ~120k characters
-        was_truncated = False
-        if len(diff_content) > max_input_length:
-            head_len = int(max_input_length * 0.7)
-            tail_len = max_input_length - head_len
-            head = diff_content[:head_len].rstrip()
-            tail = diff_content[-tail_len:].lstrip()
-            diff_content = (
-                f"{head}\n" "... (context truncated due to length) ...\n" f"{tail}"
+        models = _list_generation_models(client)
+        if not models:
+            raise Exception(
+                "No usable model available for current API key. "
+                "No generation models found for this key."
             )
-            was_truncated = True
 
-        detailed_mode = was_truncated or _is_truncated_or_compacted(diff_content)
-
-        if detailed_mode:
-            prompt = (
-                "Generate a commit message in English based on the following git "
-                "change context.\n"
-                "The context may include git status, changed file lists, diff "
-                "summaries, untracked file previews, recent git log, and "
-                "staged/unstaged diffs.\n\n"
-                "Important: The context may be truncated/compacted. "
-                "If so, infer details from the file list and diff stats rather "
-                "than referencing exact line-level changes.\n\n"
-                "The commit message must follow this format:\n"
-                "1. First line: A short summary (max 50 characters) in format "
-                '"Type: Brief description"\n'
-                "2. Blank line\n"
-                "3. A detailed body (more detailed than usual):\n"
-                "   - Prefer 8-14 bullet points\n"
-                "   - Mention key files/modules when useful\n"
-                "   - Include rationale/impact where it is evident\n\n"
-                "Example format:\n"
-                "```\n"
-                "feat: Improve commit context handling\n\n"
-                "- Expand git context to include untracked previews\n"
-                "- Add staged/unstaged diff stats for better summarization\n"
-                "- Compact large diffs by file to preserve coverage\n"
-                "- Include recent history snapshots for broader context\n"
-                "- Improve truncation strategy to keep head+tail\n"
-                "```\n\n"
-                f"Git change context:\n{diff_content}\n\n"
-                "Return only the commit message in the format above, without "
-                "any extra commentary."
+        # Size the diff using the same tokenizer the API uses (count_tokens) on
+        # the model with the largest input budget (so we keep as many chars as
+        # that model can actually take).
+        reference_model = models[0][0]
+        largest_in = max(1, int(models[0][1]))
+        max_input_tokens = max(1, largest_in - _INPUT_TOKEN_SAFETY_MARGIN)
+        raw_diff = diff_content
+        use_detailed = _is_truncated_or_compacted(raw_diff)
+        pfx, sfx = _build_commit_prompt_prefix_suffix(use_detailed)
+        body, was_trunc = _fit_diff_to_input_tokens(
+            client,
+            reference_model,
+            pfx,
+            sfx,
+            raw_diff,
+            max_input_tokens,
+        )
+        if was_trunc and not use_detailed:
+            use_detailed = True
+            pfx, sfx = _build_commit_prompt_prefix_suffix(True)
+            body, was_trunc = _fit_diff_to_input_tokens(
+                client,
+                reference_model,
+                pfx,
+                sfx,
+                raw_diff,
+                max_input_tokens,
             )
-            max_output_tokens = 700
-        else:
-            prompt = (
-                "Generate a commit message in English based on the following git "
-                "change context.\n"
-                "The context may include git status, changed file lists, diff "
-                "summaries, untracked file previews, recent git log, and "
-                "staged/unstaged diffs.\n\n"
-                "The commit message should follow this format:\n"
-                "1. First line: A short summary (max 50 characters) in format "
-                '"Type: Brief description"\n'
-                "2. Blank line\n"
-                "3. Detailed description explaining what was changed and why "
-                "(2-4 sentences)\n\n"
-                "Example format:\n"
-                "```\n"
-                "feat: Add user authentication\n\n"
-                "Implement login and registration functionality with "
-                "JWT tokens.\n"
-                "Added password hashing using bcrypt for security.\n"
-                "Created user model and authentication middleware.\n"
-                "```\n\n"
-                f"Git change context:\n{diff_content}\n\n"
-                "Return only the commit message in the format above, without "
-                "any explanations or special characters."
-            )
-            max_output_tokens = 300
+        prompt = pfx + body + sfx
 
-        model_candidates = select_available_models(client)
         last_error = None
         response = None
         response_finish_reason = ""
         selected_commit_message = ""
 
-        # Try candidates in order, fallback automatically on transient issues.
-        # For each model, retry with a larger output budget if result looks cut.
-        token_attempts = [
-            max_output_tokens,
-            min(2048, max(max_output_tokens * 2, 900)),
-        ]
-        for selected_model in model_candidates:
-            for output_token_budget in token_attempts:
-                try:
-                    response = client.models.generate_content(
-                        model=selected_model,
-                        contents=prompt,
-                        config={
-                            "temperature": 0.5,
-                            "max_output_tokens": output_token_budget,
-                        },
-                    )
-                    commit_text = (getattr(response, "text", "") or "").strip()
-                    finish_reason = _extract_finish_reason(response)
+        # Each call uses that model's full output_token_limit (no app-side cap).
+        for selected_model, _in_lim, out_lim in models:
+            out_cap = int(out_lim) if int(out_lim) > 0 else 8192
+            try:
+                response = client.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                    config={
+                        "temperature": 0.5,
+                        "max_output_tokens": out_cap,
+                    },
+                )
+                commit_text = (getattr(response, "text", "") or "").strip()
+                finish_reason = _extract_finish_reason(response)
 
-                    if not commit_text:
-                        response = None
-                        continue
+                if not commit_text:
+                    continue
 
-                    if (
-                        "max" in finish_reason
-                        or "length" in finish_reason
-                        or _looks_incomplete_message(commit_text)
-                    ):
-                        # Retry same model with larger budget.
-                        selected_commit_message = commit_text
-                        response_finish_reason = finish_reason
-                        response = None
-                        continue
-
+                if (
+                    "max" in finish_reason
+                    or "length" in finish_reason
+                    or _looks_incomplete_message(commit_text)
+                ):
+                    # Keep partial; try next model in case a larger output cap
+                    # or different model completes the message.
                     selected_commit_message = commit_text
                     response_finish_reason = finish_reason
-                    break
-                except Exception as model_error:
-                    last_error = model_error
-                    err_text = str(model_error).lower()
-                    # Continue trying next model for quota/rate errors.
-                    if any(
-                        token in err_text
-                        for token in (
-                            "resource_exhausted",
-                            "quota",
-                            "rate",
-                            "429",
-                            "503",
-                            "unavailable",
-                            "high demand",
-                            "temporarily",
-                            "not found",
-                            "unsupported",
-                        )
-                    ):
-                        break
-                    raise
-            if selected_commit_message:
+                    continue
+
+                selected_commit_message = commit_text
+                response_finish_reason = finish_reason
                 break
+            except Exception as model_error:
+                last_error = model_error
+                err_text = str(model_error).lower()
+                # Continue trying next model for quota/rate errors.
+                if any(
+                    token in err_text
+                    for token in (
+                        "resource_exhausted",
+                        "quota",
+                        "rate",
+                        "429",
+                        "503",
+                        "unavailable",
+                        "high demand",
+                        "temporarily",
+                        "not found",
+                        "unsupported",
+                    )
+                ):
+                    continue
+                raise
 
         if not selected_commit_message:
             raise Exception(
